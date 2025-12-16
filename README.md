@@ -1,2 +1,2 @@
-# GAME-Borzoi-human
+# GAME-Borzoi-human-predictor
 Borzoi is a deep learning model that predicts cell-type and tissue-specific RNA-seq coverage directly from DNA sequence, enabling interpretation of genetic variants across multiple layers of gene regulation, including transcription, splicing, and polyadenylation. It is trained on human RNA-seq data from ENCODE (with 866 datasets across diverse biosamples, including cell lines and adult tissues) and Genotype-Tissue Expression (GTEx) data (with 2-3 replicates for each tissue, processed by the recount3 project). The training dataset also includes epigenomic datasets from the Enformer model, such as CAGE, DNase-seq, ATAC-seq, and ChIP-seq tracks.
