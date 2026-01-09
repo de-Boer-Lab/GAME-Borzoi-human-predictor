@@ -1,0 +1,200 @@
+Bootstrap: docker
+From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+
+%files
+    ./borzoi_API_script_and_utils /src/borzoi_API_script_and_utils
+    ./script_and_utils /src/script_and_utils
+    ./borzoi_gpu_environment.yml /borzoi_gpu_environment.yml
+
+%environment
+    # Prevent automatic binding of host directories
+    export APPTAINER_NO_MOUNT="home,tmp,proc,sys,dev"
+    export PATH="/opt/conda/envs/borzoi-gpu/bin:$PATH"
+    export LD_LIBRARY_PATH="/opt/conda/envs/borzoi-gpu/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+    export CUDA_HOME="/opt/conda/envs/borzoi-gpu"
+    export TF_CUDNN_USE_FRONTEND=1
+
+%post
+    # Install system packages needed for conda and building extensions
+    echo "Installing system dependencies..."
+    apt-get update && apt-get install -y --no-install-recommends \
+        wget \
+        build-essential \
+        zlib1g-dev
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    # Install Miniconda
+    echo "Setting up Miniconda..."
+    wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /miniconda.sh
+    bash /miniconda.sh -b -p /opt/conda
+    rm /miniconda.sh
+
+    # Temporarily add conda to PATH for this script
+    export PATH=/opt/conda/bin:$PATH
+
+    echo "Setting solver to classic and disabling plugins..."
+    CONDA_NO_PLUGINS=true conda config --set solver classic
+
+    # Create the conda environment using the correct file path
+    echo "Creating Conda environment 'borzoi_gpu_environment'..."
+    CONDA_NO_PLUGINS=true conda env create -f /borzoi_gpu_environment.yml
+    conda clean -a -y
+
+    # Activate the environment for subsequent commands
+    echo "Activating Conda environment..."
+    . /opt/conda/etc/profile.d/conda.sh
+    conda activate borzoi-gpu
+
+    echo "Installing Baskerville and Borzoi from local directories..."
+    export SETUPTOOLS_SCM_PRETEND_VERSION="0.1"
+    pip install --no-cache-dir \
+        /src/borzoi_API_script_and_utils/baskerville \
+        /src/borzoi_API_script_and_utils/borzoi
+    
+    echo "Installing flask..."
+    pip install flask
+    # pip install waitress
+
+    # Set permissions to access all directories
+    echo "Setting permissions..."
+    chmod -R 755 /src
+
+%runscript
+    # This section defines the default run behavior of the container
+    echo "Container is running with Borzoi GPU environment activated"
+    export PATH="/opt/conda/envs/borzoi-gpu/bin:$PATH"
+    exec python3 /src/script_and_utils/borzoi_predictor_API.py "$@"
+%startscript
+    echo "Container is starting with Borzoi GPU environment activated"
+    export PATH="/opt/conda/envs/borzoi-gpu/bin:$PATH"
+    exec python3 /src/script_and_utils/borzoi_predictor_API.py "$@"
+%labels
+    Author "Satyam Priyadarshi"
+    Version "1.0"
+    Description "A RESTful Borzoi Predictor for the Genomic API for Model Evaluation Framework"
+
+%help
+    This container for Predictor includes:
+    - Flask-based REST API for sequence processing and prediction handling.
+    - Integrated Borzoi model with its dependencies and `borzoi-gpu` conda environment created using `borzoi_gpu_environment.yml`.
+    - Baskerville and Borzoi packages, installed from local source copies of repositories (as of March 2025), which also contain 
+      helper scripts and 4 replicate model weights (pre-downloaded). 
+    - Support scripts like `error_checking_functions.py`, `schema_validation.py`, `predictor_content_handler.py`, 
+      and `predictor_help_message.json`.
+    
+    NOTE: This container requires a GPU for execution because the Borzoi model relies on GPU-accelerated operations from TensorFlow. 
+    Running on CPU may lead to excessive memory usage and thread allocation failures.
+
+    Usage:
+    We encourage using the pre-built container for this model that are hosted on Zenodo. Visit https://github.com/de-Boer-Lab/Genomic-API-for-Model-Evaluation for more information.
+
+    However, if you are building the container using the provided definition file, ensure you have the following directory structure on the host:
+
+    ```bash
+    path/to/src
+    ├── README.md
+    ├── borzoi_API_script_and_utils
+    │   ├── baskerville/
+    │   ├── borzoi/
+    │   │   ├── LICENSE
+    │   │   ├── README.md
+    │   │   ├── borzoi_logo.png
+    │   │   ├── data/
+    │   │   ├── examples/
+    │   │   │   └── saved_models/
+    │   │   │       ├── f3c0/train/model0_best.h5
+    │   │   │       ├── f3c1/train/model0_best.h5
+    │   │   │       ├── f3c2/train/model0_best.h5
+    │   │   │       └── f3c3/train/model0_best.h5
+    │   │   ├── pyproject.toml
+    │   │   ├── src/
+    │   │   └── tutorials/
+    │   ├── borzoi_predict_codebase.py
+    │   ├── borzoi_utils.py
+    │   ├── model_validation.py
+    │   └── simplify_targets/
+    │       ├── borzoi_human_targets_simplified.txt
+    │       └── parse_borzoi_target.py
+    ├── borzoi_gpu_environment.yml
+    ├── predictor.def
+    ├── borzoi_human_predictor.sif
+    └── script_and_utils/
+        ├── borzoi_predictor_API.py
+        ├── error_checking_functions.py
+        ├── schema_validation.py
+        ├── predictor_content_handler.py
+        └── predictor_help_message.json
+    ```
+
+    Model Availability:
+    The model weights (.h5 files) should be pre-downloaded and placed in the `borzoi/examples/saved_models/` directory 
+    before building the container. If you need to download them, run the `download_models.sh` script from the 
+    `borzoi_API_script_and_utils/borzoi/` directory:
+
+    ```bash
+    cd borzoi
+    ./download_models.sh
+    ```
+
+    **NOTE:** Downloading the model weights requires python modules like `pyfaidx`. For more details regarding the models, 
+    please refer to [Borzoi Github Repository](https://github.com/calico/borzoi?tab=readme-ov-file#model-availability).
+
+    The saved models should be arranged as follows (based on HUMAN training data only):
+
+    ```bash
+    borzoi_API_script_and_utils/borzoi/examples/saved_models/
+    ├── f3c0/train/model0_best.h5
+    ├── f3c1/train/model0_best.h5
+    ├── f3c2/train/model0_best.h5
+    └── f3c3/train/model0_best.h5
+    ```
+    
+    Build the container (SIF):
+    ```bash
+    apptainer build borzoi_human_predictor.sif predictor.def
+    ```
+
+    Testing the Container:
+    
+    Once running, test the API endpoints:
+    ```bash
+    # Check supported formats
+    curl http://172.xx.xx.xx:5000/formats
+
+    # Get help information
+    curl http://172.xx.xx.xx:5000/help
+    ```
+    
+    Run the container:
+    ```bash
+    apptainer run --nv --containall borzoi_human_predictor.sif HOST_IP HOST_PORT MATCHER_IP MATCHER_PORT
+    ```
+
+    Details:
+    - The container runs a Flask REST API that receives prediction requests via HTTP endpoints.
+    - Replace `HOST_IP` and `HOST_PORT` with the IP address and port where the Predictor API should listen.
+    - Replace `MATCHER_IP` and `MATCHER_PORT` with the IP and port configuration of the Matcher service for cell type 
+      and track name resolution. If Matcher is not needed for your task, provide placeholder values.
+    - The `--nv` flag enables NVIDIA GPU and CUDA library support for running GPU-accelerated applications.
+    - The `--containall` flag ensures a clean, isolated environment for reproducible runs.
+
+    API Endpoints:
+    - GET  /formats - Returns supported request and response formats
+    - GET  /help    - Returns predictor metadata and usage information
+    - POST /predict - Main endpoint for submitting prediction requests
+
+    Purpose:
+    - Facilitates genomic model evaluation and prediction using the Borzoi model.
+    - Designed to integrate seamlessly with the Genomic API for Model Evaluation (GAME) framework.
+    - Supports communication with Matcher service for flexible cell type and track name resolution.
+
+    Example Command:
+    ```bash
+    apptainer run --nv --containall borzoi_human_predictor.sif 172.xx.xx.xx 5000 192.xx.xx.xx 6000
+    ```
+
+    Arguments:
+    1. `HOST_IP`: IP address where the Predictor API will listen (e.g. 0.0.0.0 for all interfaces).
+    2. `HOST_PORT`: Port number the Predictor API will listen on (e.g. 5000).
+    3. `MATCHER_IP`: IP address of the Matcher service (Optional).
+    4. `MATCHER_PORT`: Port number of the Matcher service (Optional).
