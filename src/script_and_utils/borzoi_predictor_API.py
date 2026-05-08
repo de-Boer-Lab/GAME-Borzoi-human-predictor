@@ -1,46 +1,24 @@
 '''Borzoi Predictor using Flask'''
-import os
 import sys
+import math
 import json
 import argparse
 
 from flask import Flask
 
+from config import BORZOI_DIR, HELP_FILE, PREDICTOR_NAME, SUPPORTED_REQUEST_FORMATS, SUPPORTED_RESPONSE_FORMATS
 from error_checking_functions import APIError, ServerError, PredictionFailedError
 from schema_validation import validate_request_payload, preprocess_data
 from predictor_content_handler import decode_request, encode_response
-
-# Get the absolute path of the script's directory
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Hardcode name of this Predictor. It will be added to ALL responses.
-PREDICTOR_NAME = "borzoi_human"
-
-# Determine if running inside a container or not
-if os.path.exists('/.singularity.d'):
-    # Running inside the container
-    print("Running inside the container...🥡")
-    BORZOI_DIR = "/src/borzoi_API_script_and_utils"
-    HELP_FILE = "/src/script_and_utils/predictor_help_message.json"
-else:
-    # Running outside the container
-    print("Running outside the container...📋")
-    PREDICTOR_CONTAINER_DIR = os.path.dirname(SCRIPT_DIR)
-    BORZOI_DIR = os.path.join(PREDICTOR_CONTAINER_DIR, "borzoi_API_script_and_utils")
-    HELP_FILE = os.path.join(SCRIPT_DIR, 'predictor_help_message.json')
 
 # Add BORZOI_DIR to the Python path
 if BORZOI_DIR not in sys.path:
     sys.path.insert(0, BORZOI_DIR)
 
-from borzoi_predict_codebase import *
+from borzoi_predict_codebase import predict_borzoi
 from model_validation import model_specific_payload_validation, apply_scaling
 
-# ------ Configuration for Wire-Format ------
-SUPPORTED_REQUEST_FORMATS = [fmt.lower() for fmt in ["application/json", "application/msgpack"]] # Remove msgpack if not supported
-SUPPORTED_RESPONSE_FORMATS = [fmt.lower() for fmt in ["application/json", "application/msgpack"]] # JSON is always supported even when not mentioned
-
-# --- NEW: Have arguments be defined globally ---
+# --- Have arguments be defined globally ---
 parser = argparse.ArgumentParser(description=f'{PREDICTOR_NAME} Predictor API')
 parser.add_argument('ip', type=str, help='IP address to bind')
 parser.add_argument('port', type=int, help='Port to bind')
@@ -65,13 +43,51 @@ else:
 # if args.threads != 4:
 #     print(f"Manual Configuration: Using {args.threads} threads.")
 
-# --- Flask App and Central Error Handler ---
+# ------------ Sanitization Functions -----------
+def _print_non_numeric(obj, path="root"):
+    """
+    Recursively print all non-numeric entries in a nested dictionary or list.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _print_non_numeric(v, path + f".{k}")
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _print_non_numeric(v, path + f"[{i}]")
+    else:
+        try:
+            # Try to convert to float
+            val = float(obj)
+            if not math.isfinite(val):
+                print(f"Non-finite numeric at {path}: {obj}")
+        except (ValueError, TypeError):
+            # Not numeric at all
+            print(f"Non-numeric at {path}: {obj}")
+
+MAX_VALUE = 1e5 
+MIN_VALUE = -1e5
+
+def _sanitize_for_json(obj):
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    elif isinstance(obj, float):
+        if math.isinf(obj) or math.isnan(obj):
+            # Replace with a large finite number
+            return MAX_VALUE if obj > 0 else MIN_VALUE
+        else:
+            return obj
+    else:
+        return obj
+
+# -------- Flask App and Central Error Handler --------
 app = Flask(__name__)
 app.json.sort_keys = False
 
 def create_error_response(error_key, messages, status_code):
     """ 
-    Formats error response into a standarized JSON structure.
+    Formats error response into a standardized JSON structure.
     
     Args:
         error_key (str): The category of the error (e.g. 'bad_prediction_request', 'prediction_request_failed').
@@ -150,11 +166,11 @@ def predict():
         # which will be caught automatically by @app.errorhandler
         validate_request_payload(evaluator_request)
         
-        # Model validation for all Borzoi-sepcific logic checks
+        # Model validation for all Borzoi-specific logic checks
         model_specific_payload_validation(evaluator_request)
         
         readout_type = evaluator_request['readout']
-        is_point_readout = readout_type == "point"
+        is_point_readout = readout_type == "point" # point by default. If "track", then is_point_readout = False -- used for conditional logic
         
         # Preprocess request
         # Applies flanks, checks specs, checks prediction ranges, and slices
@@ -171,17 +187,32 @@ def predict():
             request_tasks.add((request_type, cell_type))
         
         print(f"Unique tasks extracted: {request_tasks}")
+        
+        # NOTE: ADDITION: Now extract prediction_ranges for all sequences, if provided
+        prediction_ranges = evaluator_request.get('prediction_ranges', {})
+        
         # Then run Borzoi Model ONCE for all required tracks
         print("Running Borzoi model on collected tasks...")
         task_predictions, matcher_version = predict_borzoi(
             sequences, request_tasks,
             matcher_ip, matcher_port,
-            is_point_readout
+            prediction_ranges, is_point_readout # NOTE ADDITION: Pass prediction ranges for proper handling downstream
             )
         
-        if isinstance(task_predictions, str):
-            # Wrap the error string into error payload 
-            raise PredictionFailedError(task_predictions)
+        # # Borzoi adds model_errors dictionary here, so if one task fails, 
+        # # the other tasks will still return predictions. We need to check if 
+        # # the overall task_predictions is an error message (str) or a dict of predictions.
+        
+        # if isinstance(task_predictions, str):
+        #     # Wrap the error string into error payload 
+        #     raise PredictionFailedError(task_predictions)
+        
+        # Pre-check: If the Matcher service suffered a fatal network failure, 
+        # fail the entire request immediately before formatting the JSON.
+        for task_data in task_predictions.values():
+            if "error" in task_data and "dependent Matcher service" in task_data["error"]:
+                from error_checking_functions import UpstreamDependencyError
+                raise UpstreamDependencyError(task_data["error"])
         
         # Now format predictions to API JSON structure
         # Create JSON to return
@@ -198,7 +229,7 @@ def predict():
             request_type = prediction_task['type']
             cell_type = prediction_task['cell_type']
             
-            # ADDITION: Determine Scale for predictions
+            # Determine Scale for predictions
             # Get requested scale
             requested_scale = prediction_task.get('scale')            
 
@@ -229,6 +260,11 @@ def predict():
                     'predictions': predictions  
                 }
             else:
+                
+                # Sanitize any non-numeric values in predictions before applying scaling, to avoid errors during transformation
+                predictions = _sanitize_for_json(predictions)
+                _print_non_numeric(predictions)
+                
                 # Apply scale
                 predictions_scaled, effective_scale = apply_scaling(predictions, requested_scale) 
                 

@@ -79,7 +79,7 @@ def apply_scaling(predictions_dict, requested_scale):
     
     Borzoi Default Output: Linear
     Logic: 
-      - If 'linear' requested: Do nothing.
+      - If 'linear' requested: Do nothing, return as is.
       - If 'log' requested: log2(x + 1)
       
     Args:

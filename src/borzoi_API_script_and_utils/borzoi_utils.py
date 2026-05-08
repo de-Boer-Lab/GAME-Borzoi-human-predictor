@@ -1,9 +1,10 @@
 # borzoi_utils.py
+'''
+Custom functions for subsetting sequences, slicing predictions, and Matcher communication for Borzoi Predictor
+'''
+
 import math
 import requests
-
-# Function to handle Evaluator request
-# Fed into the model by Predictor
 
 MATCHER_NULL_RESPONSE = "NULL"
 
@@ -14,24 +15,77 @@ class MatcherNotConfiguredError(Exception):
     """
     pass
 
-def slice_prediction_tracks(full_track, original_seq_len, model_input_len, bin_size, buffer_bp=1024):
+def subset_sequence_for_ranges(sequence, pred_range, prediction_window, context_flank):
+    """
+    Subset the input sequence based on the prediction range, prediction window, and context flank.
+    
+    It means we will take a portion of the input sequence that includes the prediction range 
+    and additional context on either side, based on the specified prediction window and context flank.
+    This is done to ensure that the model has enough surrounding sequence information to make accurate 
+    predictions for the specified range.
+    
+    Logic:
+    1. If prediction range size < prediction window:
+        center the prediction range within the prediction window 
+        and add context flank on either side.
+    2. If prediction range size >= prediction window:
+        simply add context flank on either side of the prediction range.
+
+    Args:
+        sequence (str): The input sequence to be subsetted.
+        pred_range (list): The start and end indices of the prediction range within the sequence.
+        prediction_window (int): The desired size of the prediction window around the prediction range.
+        context_flank (int): The number of additional bases to include on either side of the prediction window for context.
+
+    Returns:
+        tuple: A tuple containing the subsetted sequence, 
+               the new start index of the prediction range within the subsetted sequence,
+               and the new end index of the prediction range within the subsetted sequence.
+    """
+    start, end = pred_range # Unpack the prediction range into start and end indices
+    pred_range_size = end - start # Calculate the size of the prediction range
+
+    if pred_range_size < prediction_window:
+        # print("Subsetting for range size < 114kb")
+        pred_range_mid = (end + start)/2
+        #Use floor to left side to not loose bases
+        new_start = max(math.floor(pred_range_mid - prediction_window/2 - context_flank), 0)
+        #use ceil on right side to not loose bases
+        new_end = min(math.ceil(pred_range_mid + prediction_window/2 + context_flank), len(sequence)) 
+        
+    else:
+        # print("Subsetting for range size >= 114kb")
+        new_start = max(math.floor(start - context_flank), 0)
+        new_end = min(math.ceil(end + context_flank), len(sequence))
+    
+    sequence_subsetted = sequence[new_start:new_end]
+
+    #The prediction range start and end is now shifted with respect to the subsetting
+    new_range_start = start - new_start
+    new_range_end = end - new_start
+    # print("New ranges are")
+    # print(new_range_start)
+    # print(new_range_end)
+    return sequence_subsetted, new_range_start, new_range_end
+
+def slice_prediction_tracks(full_track, original_seq_len, model_input_len, bin_size, buffer_bp=32*32):
     
     """
-    Sliced a full prediction track to keep only bins corresponding to with just
+    Slices a full prediction track to keep only bins corresponding to with just
     N-padding predictions removed.
     
     Args:
         full_track (np.array): The 3D full-length prediction array from the model (1, 16352, num_tracks)
-        original_seq_len (int): The length of original, unpadded sequence.
+        original_seq_len (int): The length of original, un-padded sequence.
         model_input_len (int): The length of the sequence required by the model
                                after padding/ trimming.
         bin_size (int): The size of each prediction bin in base pairs.
-        buffer_bp (int): The total number of base pairs cropped by the model.
+        buffer_bp (int): The total number of base pairs cropped by the model (32 bins of 32 bp each).
         
     Returns:
         sliced_track (np.array): The sliced 3D prediction track with bins with just
                                  N-padding removed.
-        N_in_left_bin (int): Number of N-padding in the leftmost bin with sequence. This is needed for `track` readouts, which has to be incorporated in borzoi_predict_codebase
+        N_in_left_bin (int): Number of N-padding in the leftmost bin with sequence.
         
     """
     
@@ -39,24 +93,65 @@ def slice_prediction_tracks(full_track, original_seq_len, model_input_len, bin_s
     total_padding = model_input_len - original_seq_len
     
     left_buffer = buffer_bp//2
+    
     # Sequence is centred but padding is right-biased (Extra N on the right, if total padding is odd)
     left_padding = total_padding // 2
     left_padding_after_buffer = max(0, left_padding - left_buffer)
     
-    # Calculate the indices of bins containing the sequence
+    # Calculate the indices of bins containing the sequence [start, end) -- end is not inclusive
     start_bin_index = left_padding_after_buffer // bin_size
     end_bin_index = math.ceil((left_padding_after_buffer + original_seq_len)/bin_size)
     
-    number_bins_with_seq = end_bin_index - start_bin_index
-    total_bases = number_bins_with_seq*bin_size
-    N_in_bins = total_bases - original_seq_len
-    N_in_left_bin = N_in_bins//2
+    N_in_left_bin = left_padding_after_buffer - (start_bin_index * bin_size)
     
     sliced_track = full_track[:, start_bin_index:end_bin_index, :]
     
     return sliced_track, N_in_left_bin
 
-def matcher_communication(matcher_ip, matcher_port, message_for_Matcher):
+def slice_prediction_tracks_for_range(full_track, original_seq_len, range_start, range_end, model_input_len, bin_size, buffer_bp=1024):
+    """
+    Slices a full prediction track to keep only bins corresponding to a specified prediction range within the original sequence, 
+    with just N-padding predictions removed.
+
+    Args:
+        full_track (np.array): The 3D full-length prediction array from the model (1, 16352, num_tracks)
+        original_seq_len (int): The length of original, un-padded sequence.
+        range_start (int): Start position of prediction range in the subsetted sequence
+        range_end (int): End position of prediction range in the subsetted sequence
+        model_input_len (int): The length of the sequence required by the model
+                        after padding/ trimming.
+        bin_size (int): The size of each prediction bin in base pairs (32 bp)
+        buffer_bp (int): The total number of base pairs cropped by the model (1024 bp; 16 bins on each side).
+        
+    Returns:
+        sliced_track (np.array): The sliced 3D prediction track for only the requested range
+        extraBases_in_left_bin (int): Number of bases in the leftmost bin that are outside the requested range (i.e. bases that are in the bin but not in the range)
+    """
+    # Calculate the total padding
+    total_padding = model_input_len - original_seq_len
+    
+    left_buffer = buffer_bp//2
+    
+    # Sequence is centred but padding is right-biased (Extra N on the right, if total padding is odd)
+    left_padding = total_padding // 2
+    left_padding_after_buffer = max(0, left_padding - left_buffer)
+    
+    # Adjust range positions to account for left padding after buffer
+    range_start_after_buffer = range_start + left_padding_after_buffer
+    range_end_after_buffer = range_end + left_padding_after_buffer
+    
+    # Calculate the indices of bins containing the requested range
+    start_bin_index = range_start_after_buffer // bin_size
+    end_bin_index = math.ceil(range_end_after_buffer/bin_size)
+    
+    sliced_track = full_track[:, start_bin_index:end_bin_index, :]
+    
+    # Calculate the number of bases trimmed upstream of the requested range
+    extraBases_in_left_bin = range_start_after_buffer - (start_bin_index * bin_size)
+    
+    return sliced_track, extraBases_in_left_bin
+
+def _matcher_communication(matcher_ip, matcher_port, message_for_Matcher):
     """
     Helper function to send a single request to the Matcher API's /match endpoint.
     Checks for Matcher configuration before attempting to connect.
@@ -174,7 +269,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                     'cell_type_list': all_accessibility_tracks['Cell Type'].unique().tolist()
                     }
                 
-                matcher_result = matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
+                matcher_result = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                 matcher_version = matcher_result.get('matcher_version', 'UnknownMatcher')
 
                 # matcher could not find any closely related cell_types
@@ -212,7 +307,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                     'cell_type_requested': cell_type,
                     'cell_type_list': all_rna_tracks['Cell Type'].unique().tolist()
                     }
-                matcher_result = matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
+                matcher_result = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                 matcher_version = matcher_result.get('matcher_version', 'UnknownMatcher')
 
                 if not matcher_result or not matcher_result.get('cell_type_actual') or matcher_result.get('cell_type_actual') == MATCHER_NULL_RESPONSE:
@@ -247,7 +342,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                     'cell_type_requested': cell_type,
                     'cell_type_list': all_cage_tracks['Cell Type'].unique().tolist()
                     }
-                matcher_result_cage = matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
+                matcher_result_cage = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                 matcher_version = matcher_result_cage.get('matcher_version', 'UnknownMatcher')
                 
                 if matcher_result_cage and matcher_result_cage.get('cell_type_actual') and matcher_result_cage.get('cell_type_actual') != MATCHER_NULL_RESPONSE:
@@ -277,7 +372,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                     'cell_type_requested': cell_type,
                     'cell_type_list': all_rna_tracks['Cell Type'].unique().tolist()
                     }
-                matcher_result_rna = matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
+                matcher_result_rna = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                 matcher_version = matcher_result_rna.get('matcher_version', 'UnknownMatcher')
 
                 if not matcher_result_rna or not matcher_result_rna.get('cell_type_actual') or matcher_result_rna.get('cell_type_actual') == MATCHER_NULL_RESPONSE:
@@ -321,7 +416,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                     'binding_molecule_list': all_chip_tracks['Molecule'].unique().tolist()
                     }
                 
-                matcher_result_molecule = matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
+                matcher_result_molecule = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                 matcher_version = matcher_result_molecule.get('matcher_version', 'UnknownMatcher')
                 
                 # matcher could not find any closely related cell_types
@@ -359,7 +454,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                             'cell_type_list': chip_tracks_molecule_mapped['Cell Type'].unique().tolist()
                             }
                         
-                        matcher_result_cell_type = matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
+                        matcher_result_cell_type = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                         matcher_version = matcher_result_cell_type.get('matcher_version', 'UnknownMatcher')
                         
                         # Use the robust check for the cell type result

@@ -1,6 +1,6 @@
 {
   "model": "Borzoi Human",
-  "version": "1.0",
+  "game_schema_version": "1.0",
   "publication" : "Linder et. al, 2025 (Nature Genetics)",
   "build_date": "November 25, 2025",
   "features": ["CAGE",
