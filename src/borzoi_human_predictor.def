@@ -59,6 +59,10 @@ From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
     echo "Setting permissions..."
     chmod -R 755 /src
 
+    # Strip any host-side __pycache__ that came in via %files
+    echo "Cleaning up __pycache__ directories..."
+    find /src -type d -name __pycache__ -exec rm -rf {} +
+
 %runscript
     # This section defines the default run behavior of the container
     echo "Container is running with Borzoi GPU environment activated"
@@ -70,8 +74,8 @@ From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
     exec python3 /src/script_and_utils/borzoi_predictor_API.py "$@"
 %labels
     Author "Satyam Priyadarshi"
-    Version "1.0"
-    Description "A RESTful Borzoi Predictor for the Genomic API for Model Evaluation Framework"
+    game_schema_version "1.0"
+    Description "A RESTful Borzoi (Human only) Predictor for the Genomic API for Model Evaluation Framework"
 
 %help
     This container for Predictor includes:
@@ -88,46 +92,8 @@ From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
     Usage:
     We encourage using the pre-built container for this model that are hosted on Zenodo. Visit https://github.com/de-Boer-Lab/Genomic-API-for-Model-Evaluation for more information.
 
-    However, if you are building the container using the provided definition file, ensure you have the following directory structure on the host:
-
-    ```bash
-    path/to/src
-    ├── README.md
-    ├── borzoi_API_script_and_utils
-    │   ├── baskerville/
-    │   ├── borzoi/
-    │   │   ├── LICENSE
-    │   │   ├── README.md
-    │   │   ├── borzoi_logo.png
-    │   │   ├── data/
-    │   │   ├── examples/
-    │   │   │   └── saved_models/
-    │   │   │       ├── f3c0/train/model0_best.h5
-    │   │   │       ├── f3c1/train/model0_best.h5
-    │   │   │       ├── f3c2/train/model0_best.h5
-    │   │   │       └── f3c3/train/model0_best.h5
-    │   │   ├── pyproject.toml
-    │   │   ├── src/
-    │   │   └── tutorials/
-    │   ├── borzoi_predict_codebase.py
-    │   ├── borzoi_utils.py
-    │   ├── model_validation.py
-    │   └── simplify_targets/
-    │       ├── borzoi_human_targets_simplified.txt
-    │       └── parse_borzoi_target.py
-    ├── borzoi_gpu_environment.yml
-    ├── predictor.def
-    ├── borzoi_human_predictor.sif
-    └── script_and_utils/
-        ├── borzoi_predictor_API.py
-        ├── error_checking_functions.py
-        ├── schema_validation.py
-        ├── predictor_content_handler.py
-        └── predictor_help_message.json
-    ```
-
     Model Availability:
-    The model weights (.h5 files) should be pre-downloaded and placed in the `borzoi/examples/saved_models/` directory 
+    The model weights (.h5 files) were downloaded and placed in the `borzoi/examples/saved_models/` directory 
     before building the container. If you need to download them, run the `download_models.sh` script from the 
     `borzoi_API_script_and_utils/borzoi/` directory:
 
@@ -151,7 +117,7 @@ From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
     
     Build the container (SIF):
     ```bash
-    apptainer build borzoi_human_predictor.sif predictor.def
+    apptainer build borzoi_human_predictor.sif borzoi_human_predictor.def
     ```
 
     Testing the Container:

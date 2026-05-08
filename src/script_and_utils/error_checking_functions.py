@@ -1,7 +1,5 @@
 '''Error Classes and Error Checking Functions for Predictor'''
 
-import numpy as np
-
 # ERROR CLASSES
 # Error classes can be added here to easily keep track of error status codes
 
@@ -40,6 +38,14 @@ class ServerError(APIError):
     def __init__(self, message="An unexpected issue occurred on the server."):
         super().__init__(message, status_code=500, error_key='server_error')
 
+class UpstreamDependencyError(APIError):
+    """
+    Exception raised when a required external service (like the Matcher) fails.
+    Corresponds to the 'upstream_dependency_failed' key.
+    """
+    def __init__(self, message="The dependent Matcher service failed."):
+        super().__init__(message, status_code=502, error_key='upstream_dependency_failed')
+
 # ------------------------
 
 # ERROR CHECKING FUNCTIONS
@@ -55,6 +61,7 @@ def check_seqs_specifications(sequences, json_return_error_model):
     for seq_id, seq in sequences.items():
         if not seq:
             json_return_error_model["prediction_request_failed"].append(f"sequence '{seq_id}' is empty")
+            continue
         
         invalid_chars = set(seq.upper()) - valid_bases
         if invalid_chars:
@@ -64,7 +71,17 @@ def check_seqs_specifications(sequences, json_return_error_model):
 
 # check the the mandatory_keys exist in the .json files
 def check_mandatory_keys(evaluator_keys, json_return_error):
+    """
+    Check that all mandatory top-level keys are present in the payload
 
+    Args:
+        evaluator_keys (list): list of keys present in the Evaluator payload
+        json_return_error (dict): dictionary to store error messages
+
+    Returns:
+        dict: Updated json_return_error with any missing key errors added
+    """
+    
     mandatory_keys = ["readout", "prediction_tasks", "sequences"] # NOTE: "request" removed
     evaluator_keys_set = set(evaluator_keys)
     missing = list(sorted(set(mandatory_keys) - evaluator_keys_set))
@@ -73,6 +90,7 @@ def check_mandatory_keys(evaluator_keys, json_return_error):
             f"The following mandatory top-level keys are missing from the JSON: {', '.join(missing)}"
         )
     return json_return_error
+
 
 def check_key_values_readout(readout_value, json_return_error):
     readout_options = ["point","track", "interaction_matrix"]
@@ -93,6 +111,7 @@ def check_key_values_readout(readout_value, json_return_error):
     else:
         pass
     return(json_return_error)
+
 
 def check_prediction_task_mandatory_keys(prediction_tasks, json_return_error):
  
@@ -128,10 +147,7 @@ def check_prediction_task_name(prediction_tasks, json_return_error):
         else:
             json_return_error['bad_prediction_request'].append("'name' value should be a string")
 
-
-
     return(json_return_error)
-
 
 
 def check_prediction_task_type(prediction_tasks, json_return_error):
@@ -219,7 +235,7 @@ def check_prediction_task_scale(prediction_tasks, json_return_error):
             pass
     return(json_return_error)
 
-def check_prediction_ranges(prediction_ranges, sequences, json_return_error):
+def check_prediction_ranges(prediction_ranges, json_return_error):
     """
     Checks that prediction_ranges are formatted correctly.
     Now includes checks for positive integers and start <= end.
@@ -228,30 +244,35 @@ def check_prediction_ranges(prediction_ranges, sequences, json_return_error):
         
         if not isinstance(value, list):
             json_return_error['bad_prediction_request'].append(f"Values for '{key}' in 'prediction_ranges' must be in a list")
+            continue
             
         if not value:
             continue
         
         if len(value) != 2:
             json_return_error['bad_prediction_request'].append(f"Range array for '{key}' in 'prediction_ranges' must have 2 elements")
+            continue
         
         if not all(isinstance(num, int) for num in value):
             json_return_error['bad_prediction_request'].append(f"Values in '{key}' in 'prediction_ranges' must be integers")
+            continue
         
         start = value[0]
         end = value[1]
         
         if start < 0 or end < 0:
-            json_return_error['bad_prediction_request'].append(f"Invalid range for '{key}' in 'prediction_ranges': indices must be positive. Received [{start}, {end}]")
+            json_return_error['bad_prediction_request'].append(
+                f"Invalid range for '{key}' in 'prediction_ranges': indices must be positive. Received [{start}, {end}]"
+                )
             
         if start > end:
             json_return_error['bad_prediction_request'].append(f"Invalid range for '{key}' in 'prediction_ranges': start index ({start}) cannot be greater than end index ({end}). Received [{start}, {end}]")
     
     return json_return_error
 
-##check that seqids have valid characters
-## apparently this is done by default in .json loads
-#it works for some but not all
+# check that seqids have valid characters
+# apparently this is done by default in .json loads
+# it works for some but not all
 
 #check that keys in sequences match those in prediction ranges
 def check_seq_ids(prediction_ranges, sequences, json_return_error):
