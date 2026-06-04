@@ -1,14 +1,20 @@
 # GAME Borzoi Human Predictor
 
-Borzoi ([Linder *et al.* 2025](https://www.nature.com/articles/s41588-024-02053-6)) is a deep learning model that predicts cell-type and tissue-specific RNA-seq coverage directly from DNA sequence, enabling interpretation of genetic variants across multiple layers of gene regulation, including transcription, splicing, and polyadenylation. It is trained on human RNA-seq data from ENCODE (with 866 datasets across diverse biosamples, including cell lines and adult tissues) and Genotype-Tissue Expression (GTEx) data (with 2-3 replicates for each tissue, processed by the recount3 project). The training dataset also includes epigenomic datasets from the Enformer model, such as CAGE, DNase-seq, ATAC-seq, and ChIP-seq tracks.
+Borzoi ([Linder *et al.* 2025](https://www.nature.com/articles/s41588-024-02053-6)) is a deep learning model that predicts cell-type and tissue-specific RNA-seq coverage directly from DNA sequence, enabling interpretation of genetic variants across multiple layers of gene regulation, including transcription, splicing, and polyadenylation. It is trained on human RNA-seq data from ENCODE (across diverse biosamples, including cell lines and adult tissues) and Genotype-Tissue Expression (GTEx) data. The training dataset also includes epigenomic datasets from the Enformer model, such as CAGE, DNase-seq, ATAC-seq, and ChIP-seq tracks.
 
 **The Predictor:**
 
 - Returns `point` and `track` predictions for the requested `(type, cell_type)` pairs.
-- The Borzoi model itself outputs predictions across all **7,611 human tracks** for every inference; the predictor extracts only the tracks needed for the request before any per-task aggregation happens (see [Section 2.2](#22-prediction-logic)).
+- The Borzoi model itself outputs predictions across all **7,611 human tracks** for every inference; the Predictor extracts only the tracks needed for the request before any per-task aggregation happens (see [Section 2.2](#22-prediction-logic)).
 - Averages across 4 trained model folds, each evaluated on both forward and reverse-complement strands.
 - Predicts on the full sequence context and slices to `prediction_ranges` afterwards, preserving regulatory flanking context.
 - Uses an optional Matcher service to suggest semantically related cell types or binding molecules when no exact match exists; degrades gracefully to "exact-match-only" mode when Matcher is not configured.
+
+**Quick start**
+
+```bash
+apptainer run --nv --containall borzoi_human_predictor.sif HOST PORT [MATCHER_IP] [MATCHER_PORT]
+```
 
 ## Important Links
 
@@ -67,12 +73,12 @@ This container for Predictor includes:
     - Returns standardized error responses (400, 422, 500) keyed by violation category.
 
 5. **Predict-Once-Filter-Many**:
-    - The Borzoi model outputs predictions across all 7,611 human tracks for every inference. The predictor performs **a single forward pass per sequence chunk** (or per tile, for long sequences) and then extracts only the union of track indices needed across all requested tasks.
+    - The Borzoi model outputs predictions across all 7,611 human tracks for every inference. The Predictor performs **a single forward pass per sequence chunk** (or per tile, for long sequences) and then extracts only the union of track indices needed across all requested tasks.
     - For a request with multiple tasks (e.g. `(expression, K562)` and `(accessibility, K562)`), tracks are deduplicated before extraction so that the same track is never selected twice. Per-task averaging happens on the already-filtered prediction array.
 
 6. **Multi-Task Tolerance**:
     - Per-task failures (unmatched cell types, missing tracks, Matcher errors) are recorded inline as `{"error": ...}` entries in `task_predictions`. Other tasks in the same request are still processed and returned.
-    - This differs from DREAM-RNN, which rejects the entire request if any task has an unsupported feature.
+    - This differs from DREAM-RNN (due to Borzoi's multi-task training), which rejects the entire request if any task has an unsupported feature.
 
 7. **Help Endpoint**:
     - Returns the contents of `predictor_help_message.json` when `/help` is queried.
@@ -91,7 +97,7 @@ Borzoi architecture constants:
 
 #### 2.2.1 Track Index Collection (runs once per request)
 
-Before any sequence is fed to the model, the predictor walks through every `(type, cell_type)` pair in the request and resolves it to a set of track indices:
+Before any sequence is fed to the model, the Predictor (filter_evaluator_request() function in borzoi_utils.py) walks through every `(type, cell_type)` pair in the request and resolves it to a set of track indices:
 
 ```text
 For each (request_type, cell_type) in request_tasks:
@@ -114,11 +120,11 @@ Final unique_track_indices is the union of all tracks needed across all tasks
 
 #### 2.2.2 Sequence Handling (runs once per sequence)
 
-The predictor handles three logical cases depending on sequence length and whether `prediction_ranges` are provided:
+The Predictor handles three logical cases depending on sequence length and whether `prediction_ranges` are provided:
 
 ```text
 1. Short sequence path (len ≤ 523,264 bp), no prediction_ranges:
-   1.1. dna_1hot centres the sequence in 524,288 bp
+   1.1. dna_1hot centers the sequence in 524,288 bp
         (right-biased: left = total_padding // 2)
    1.2. Predict -> extract unique_track_indices -> average across 4 folds
         (each fold averages forward and reverse-complement strands internally)
@@ -160,7 +166,7 @@ The predictor handles three logical cases depending on sequence length and wheth
 
 #### 2.2.3 Per-Task Aggregation (runs once per (sequence, task) pair)
 
-After bin-level predictions are assembled, per-task aggregation is applied:
+After bin-level predictions are assembled, per-task aggregation is applied (_assign_predictions_to_tasks() function in borzoi_predict_codebase.py):
 
 ```text
 For each task with valid track_indices:
@@ -325,7 +331,9 @@ Matcher service is NOT configured. Running in 'exact-match-only' mode.
 }
 ```
 
-The `predictor_name` matches the container build timestamp, allowing evaluation results to be traced back to a specific build. `trim_upstream` reports how many base pairs of the leftmost returned bin fall before `range_start` &mdash; the Evaluator uses this to align bin-level predictions to base-level coordinates.
+The `predictor_name` matches the container build timestamp, allowing evaluation results to be traced back to a specific build. `trim_upstream` reports how many base pairs of the leftmost returned bin fall before `range_start` &mdash; the Evaluator uses this to align bin-level predictions to base-level coordinates. 
+
+Note: For track requests, once the Evaluator expands Borzoi predictions using `bin_size`, they should be cropped using `trim_upstream` upstream and the remaining downstream excess should be cropped to achieve a 1-1 mapping of sequence to predictions. 
 
 ---
 
