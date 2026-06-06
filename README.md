@@ -144,7 +144,7 @@ The Predictor handles three logical cases depending on sequence length and wheth
 3. Long sequence path (len > 523,264 bp):
    3.1. Prepend HALF_BUFFER (512 bp) of N-padding so bin 0 of the tiled output
         aligns with base 0 of the input
-   3.2. Tile through the sequence with stride = prediction_window:
+   3.2. Tile in a loop through the sequence with stride = prediction_window (no overlaps):
         Case a (full chunk):     run model directly, append all 16,352 bins
         Case b (tail > pred_win): pad downstream with Ns to MODEL_INPUT_LEN, predict,
                                   crop pure-N bins from the end, continue
@@ -153,7 +153,7 @@ The Predictor handles three logical cases depending on sequence length and wheth
         (Cases b and c share the same prediction logic -- they only differ in whether
          the tiling loop continues or breaks afterwards)
    3.3. Each tile extracts unique_track_indices from the model output before being
-        appended -- pure-N bin cropping happens on the already-filtered tile
+        appended
    3.4. Concatenate all tile outputs into a single (total_bins, n_tracks) array
    3.5. If prediction_ranges:
           start_bin = floor(range_start / BIN_SIZE)
