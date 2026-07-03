@@ -20,7 +20,7 @@ apptainer run --nv --containall borzoi_human_predictor.sif HOST PORT [MATCHER_IP
 
 - To learn more about the GAME Framework ([Main GAME Repository](https://github.com/de-Boer-Lab/Genomic-API-for-Model-Evaluation), [preprint](https://www.biorxiv.org/content/10.1101/2025.07.04.663250v1.full))
 - GAME Documentation: [ReadTheDocs](https://genomic-api-for-model-evaluation-documentation.readthedocs.io)
-- Pre-built Borzoi container image: [Zenodo]([LINK HERE])
+- Pre-built Borzoi container image: [Hugging Face](https://huggingface.co/datasets/deBoerLab/Borzoi_Predictor_GAME)
 - To learn more about Borzoi: [Borzoi GitHub Repository](https://github.com/calico/borzoi)
 
 ---
