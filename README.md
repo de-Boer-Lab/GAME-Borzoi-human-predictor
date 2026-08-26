@@ -6,7 +6,7 @@ Borzoi ([Linder *et al.* 2025](https://www.nature.com/articles/s41588-024-02053-
 
 - Returns `point` and `track` predictions for the requested `(type, cell_type)` pairs.
 - The Borzoi model itself outputs predictions across all **7,611 human tracks** for every inference; the Predictor extracts only the tracks needed for the request before any per-task aggregation happens (see [Section 2.2](#22-prediction-logic)).
-- Averages across 4 trained model folds, each evaluated on both forward and reverse-complement strands.
+- Averages across 4 trained model folds; within each fold, the sequence is predicted in both its forward and reverse-complement orientation and the two predictions are averaged.
 - Predicts on the full sequence context and slices to `prediction_ranges` afterwards, preserving regulatory flanking context.
 - Uses an optional Matcher service to suggest semantically related cell types or binding molecules when no exact match exists; degrades gracefully to "exact-match-only" mode when Matcher is not configured.
 
