@@ -13,6 +13,9 @@ From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
     export LD_LIBRARY_PATH="/opt/conda/envs/borzoi-gpu/lib:/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
     export CUDA_HOME="/opt/conda/envs/borzoi-gpu"
     export TF_CUDNN_USE_FRONTEND=1
+    # TensorFlow 2.15 has no prebuilt kernels for newer GPUs (e.g. H100, compute capability 9.0) and JIT-compiles
+    # them with the ptxas/libdevice bundled in the environment; point XLA at that directory
+    export XLA_FLAGS="--xla_gpu_cuda_data_dir=/opt/conda/envs/borzoi-gpu/lib/python3.9/site-packages/nvidia/cuda_nvcc${XLA_FLAGS:+ $XLA_FLAGS}"
 
 %post
     # Install system packages needed for conda and building extensions
@@ -140,7 +143,8 @@ From: nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
     - The container runs a Flask REST API that receives prediction requests via HTTP endpoints.
     - Replace `HOST_IP` and `HOST_PORT` with the IP address and port where the Predictor API should listen.
     - Replace `MATCHER_IP` and `MATCHER_PORT` with the IP and port configuration of the Matcher service for cell type 
-      and track name resolution. If Matcher is not needed for your task, provide placeholder values.
+      and track name resolution. Both are optional: if the Matcher is not needed, omit them (the Predictor then
+      runs in exact-match-only mode).
     - The `--nv` flag enables NVIDIA GPU and CUDA library support for running GPU-accelerated applications.
     - The `--containall` flag ensures a clean, isolated environment for reproducible runs.
 

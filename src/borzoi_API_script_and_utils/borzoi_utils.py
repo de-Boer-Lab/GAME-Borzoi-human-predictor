@@ -6,8 +6,6 @@ Custom functions for subsetting sequences, slicing predictions, and Matcher comm
 import math
 import requests
 
-MATCHER_NULL_RESPONSE = "NULL"
-
 class MatcherNotConfiguredError(Exception):
     """
     Custom exception raised when an exact match failed and the Matcher is 
@@ -218,9 +216,12 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
             - pd.DataFrame or str: A DataFrame of filtered tracks or an error string.
             - str or None: The actual cell type used (requested or matched).
             - list or None: The actual assay type used (requested or matched; e.g. ["RNA"] or ["ATAC", "DNASE"]).
-            - str: The version of the matcher service used, or "N/A".
+            - str or None: The version of the matcher service used, or None if the Matcher
+                           was not used. The sentinel "error" means the Matcher was needed
+                           but could not be reached; the first element is then an error
+                           message and the caller fails only that task.
     """
-    request_error_msg = f"Request Error: No tracks in the requested type: {request_type} and cell type: {cell_type} found."
+    request_error_msg = f"No tracks found for {request_type} in cell type '{cell_type}'"
     
     try: 
         print(f"Received evaluator request from Predictor to filter desired tracks\
@@ -234,7 +235,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
         # Special case: if request_type is "all_tracks", return all available tracks, no matter the cell type
         if request_type == "all_tracks":
             print("All tracks request detected: returning all available tracks for prediction.")
-            return simplified_targets_df, "all", ["all"], "N/A"
+            return simplified_targets_df, "all", ["all"], None
         
         # Define TF binding/ histone modification molecule for ChIP-Seq
         molecule = request_type.split("_")[1] if request_type.startswith("binding_") else None
@@ -253,7 +254,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
             
             if not accessibility_tracks.empty:
                 request_actual = accessibility_tracks['Assay'].unique().tolist()
-                return accessibility_tracks, cell_type, request_actual, "N/A"
+                return accessibility_tracks, cell_type, request_actual, None
 
             # if no exact match was found use the Matcher module to find a closely related cell type
             if accessibility_tracks.empty:
@@ -274,7 +275,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
 
                 # matcher could not find any closely related cell_types
                 # NOTE: adding more error checks and using .get(), which will return NoneType if missing, which is seemingly safer for type errors
-                if not matcher_result or not matcher_result.get('cell_type_actual') or matcher_result.get('cell_type_actual') == MATCHER_NULL_RESPONSE:
+                if not matcher_result or not matcher_result.get('cell_type_actual'):
                     print("No similar cell types were found using Matcher")
                     return request_error_msg, None, None, matcher_version
                 else:
@@ -297,7 +298,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                 (simplified_targets_df['Cell Type'].str.lower() == cell_type)
             ]
             if not rna_tracks.empty:
-                return rna_tracks, cell_type, ["RNA"], "N/A"
+                return rna_tracks, cell_type, ["RNA"], None
             
             # If no exact match was found, use the Matcher module
             if rna_tracks.empty:
@@ -310,7 +311,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                 matcher_result = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                 matcher_version = matcher_result.get('matcher_version', 'UnknownMatcher')
 
-                if not matcher_result or not matcher_result.get('cell_type_actual') or matcher_result.get('cell_type_actual') == MATCHER_NULL_RESPONSE:
+                if not matcher_result or not matcher_result.get('cell_type_actual'):
                     print("No similar cell types were found using Matcher")
                     return request_error_msg, None, None, matcher_version
                 else:
@@ -332,7 +333,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                 (simplified_targets_df['Cell Type'].str.lower() == cell_type)
             ]
             if not cage_tracks.empty:
-                return cage_tracks, cell_type, ["CAGE"], "N/A"
+                return cage_tracks, cell_type, ["CAGE"], None
             
             # If no exact CAGE match, query the Matcher for a CAGE substitute
             if cage_tracks.empty:
@@ -345,7 +346,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                 matcher_result_cage = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                 matcher_version = matcher_result_cage.get('matcher_version', 'UnknownMatcher')
                 
-                if matcher_result_cage and matcher_result_cage.get('cell_type_actual') and matcher_result_cage.get('cell_type_actual') != MATCHER_NULL_RESPONSE:
+                if matcher_result_cage and matcher_result_cage.get('cell_type_actual'):
                     matched_cell_type = matcher_result_cage['cell_type_actual']
                     print(f"Matcher cell type will be used for CAGE: {matched_cell_type}")
                     matched_cage_tracks = simplified_targets_df[
@@ -363,7 +364,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                 (simplified_targets_df['Cell Type'].str.lower() == cell_type)
             ]
             if not rna_tracks.empty:
-                    return rna_tracks, cell_type, ["RNA"], "N/A"
+                    return rna_tracks, cell_type, ["RNA"], None
                 
             if rna_tracks.empty:
                 print(f"No exact RNA match for {cell_type}. Querying Matcher for RNA fallback.")
@@ -375,7 +376,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                 matcher_result_rna = _matcher_communication(matcher_ip, matcher_port, message_for_Matcher)
                 matcher_version = matcher_result_rna.get('matcher_version', 'UnknownMatcher')
 
-                if not matcher_result_rna or not matcher_result_rna.get('cell_type_actual') or matcher_result_rna.get('cell_type_actual') == MATCHER_NULL_RESPONSE:
+                if not matcher_result_rna or not matcher_result_rna.get('cell_type_actual'):
                     print("No similar cell types were found using Matcher")
                     return request_error_msg, None, None, matcher_version
                 else:
@@ -401,7 +402,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                 # request_actual_assay = chip_tracks['Assay'].unique()
                 # request_actual_molecule = chip_tracks['Molecule'].unique()
                 # return chip_tracks, cell_type, f"{request_actual_assay}_{request_actual_molecule}" # CHIP_{molecule}
-                return chip_tracks, cell_type, [f"CHIP_{molecule}"], "N/A"
+                return chip_tracks, cell_type, [f"CHIP_{molecule}"], None
 
             else:
                 # If no exact match, try to match the molecule first
@@ -420,7 +421,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                 matcher_version = matcher_result_molecule.get('matcher_version', 'UnknownMatcher')
                 
                 # matcher could not find any closely related cell_types
-                if not matcher_result_molecule or not matcher_result_molecule.get('binding_molecule_actual') or matcher_result_molecule.get('binding_molecule_actual') == MATCHER_NULL_RESPONSE:
+                if not matcher_result_molecule or not matcher_result_molecule.get('binding_molecule_actual'):
                     print("No similar molecule tracks were found using Matcher.")
                     return request_error_msg, None, None, matcher_version
                 
@@ -458,7 +459,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
                         matcher_version = matcher_result_cell_type.get('matcher_version', 'UnknownMatcher')
                         
                         # Use the robust check for the cell type result
-                        if not matcher_result_cell_type or not matcher_result_cell_type.get('cell_type_actual') or matcher_result_cell_type.get('cell_type_actual') == MATCHER_NULL_RESPONSE:
+                        if not matcher_result_cell_type or not matcher_result_cell_type.get('cell_type_actual'):
                             print("No similar cell types were found using Matcher for the specified molecule.")
                             return request_error_msg, None, None, matcher_version
                         
@@ -481,7 +482,7 @@ def filter_evaluator_request(simplified_targets_df, request_type, cell_type, mat
         
     except MatcherNotConfiguredError as e:
         print(f"No exact match found and Matcher is not configured to perform this task: {e}")
-        return request_error_msg, None, None, "N/A"
+        return request_error_msg, None, None, None
 
     except ConnectionError as e:
         print(f"A fatal error occurred while communicating with the Matcher: {e}")

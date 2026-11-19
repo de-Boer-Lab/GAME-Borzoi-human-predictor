@@ -108,8 +108,12 @@ def _collect_required_track_indices(request_tasks, matcher_ip, matcher_port):
 
     Returns:
         task_to_indices (dict): Dictionary to store required track indices from each task.
+                                A task that cannot be performed maps to
+                                {"error": [{"<error_key>": "<message>"}]} instead:
+                                "prediction_request_failed" if no matching tracks were found, or
+                                "upstream_dependency_failed" if the Matcher was needed but unreachable.
         unique_track_indices (list): Sorted list of all unique track indices needed for prediction.
-        overall_matcher_version (str): The version of Matcher service used, or "N/A" if it was not called.
+        overall_matcher_version (str or None): The version of Matcher service used, or None if it was not called.
     """
     
     print("Collecting track indices for requested tasks...")
@@ -130,7 +134,7 @@ def _collect_required_track_indices(request_tasks, matcher_ip, matcher_port):
     # Example: [1, 2, 3]   
 
     # Initialize variable to hold Matcher version
-    overall_matcher_version = "N/A"
+    overall_matcher_version = None  # Stays None if the Matcher is never used
     
     _, simplified_targets_df = _load_targets()
 
@@ -140,22 +144,34 @@ def _collect_required_track_indices(request_tasks, matcher_ip, matcher_port):
         filtered_tracks, cell_type_actual, type_actual, task_matcher_version = filter_evaluator_request(simplified_targets_df,
                                                 request_type, cell_type, matcher_ip, matcher_port) # NOTE: Filter function will call the Matcher
         
-        if task_matcher_version not in ["N/A", "error"]:
+        if task_matcher_version == "error":
+            # The Matcher was needed but failed or was unreachable, so no version could be obtained
+            # ("UnknownMatcher" is returned as null by the API). A version from another task wins.
+            if overall_matcher_version is None:
+                overall_matcher_version = "UnknownMatcher"
+        elif task_matcher_version is not None:
             overall_matcher_version = task_matcher_version
         
         task_key = (request_type, cell_type)
         
         if isinstance(filtered_tracks, str):
             # The function failed, and 'filtered_tracks' now holds the error message.
-            # Return this error message to the API to be sent to the client.
+            # Store it as an error object ({"error": [{"<error_key>": "<message>"}]}) that the API
+            # returns as this task's `predictions`.
+            # "error" as the Matcher version means the Matcher was needed but failed or was unreachable.
+            # Only this task fails (with the distinct "upstream_dependency_failed" key); other tasks are still returned.
+            error_key = "upstream_dependency_failed" if task_matcher_version == "error" else "prediction_request_failed"
             print(f"No matching tracks found for {request_type} and {cell_type}. Skipping...")
-            task_to_indices[task_key] = {"error": filtered_tracks}
+            task_to_indices[task_key] = {"error": [{error_key: filtered_tracks}]}
             continue
             
         # Otherwise, proceed as before -- knowing filtered_tracks is a DataFrame
         track_indices = filtered_tracks.index.tolist()
         if not track_indices:
+            # Never silently drop a task: every task must be returned, with an error if it failed.
             print(f"No matching tracks found for {request_type} and {cell_type}. Skipping...")
+            task_to_indices[task_key] = {"error": [{"prediction_request_failed":
+                f"No tracks found for {request_type} in cell type '{cell_type}'"}]}
             continue
         # Avoid printing a huge list for "all_tracks" requests:
         if request_type.lower() == "all_tracks":
@@ -184,7 +200,7 @@ def _encode_predict_fold_average(seq_chunk, unique_track_indices):
     raw_pred = predict_tracks(models, encoded_seq)[:, :, :, unique_track_indices]
     
     # Average across model folds to reduce (1, n_folds, 16352, num_tracks) -> (1, 16352, num_tracks)
-    fold_averaged_predictions = np.mean(raw_pred, axis=1).squeeze(0) # Shape (16352, num_tracks)
+    fold_averaged_predictions = np.mean(raw_pred, axis=1, dtype=np.float32).squeeze(0) # Shape (16352, num_tracks)
     
     return fold_averaged_predictions
 
@@ -391,7 +407,8 @@ def _assign_predictions_to_tasks(task_predictions, task_to_indices, predictions,
             else:
                 # "track" readout: Return predictions across bins of interest without averaging across them
                 # Store predictions in task-specific dictionary
-                task_predictions[task_key][seq_id] = np.round(avg_prediction, 5).squeeze().tolist()
+                # atleast_1d: a single-bin result must stay a 1-D list, not collapse to a bare number
+                task_predictions[task_key][seq_id] = np.atleast_1d(np.round(avg_prediction, 5).squeeze()).tolist()
                 # Need to add trim upstream if it exists
                 task_predictions[task_key].setdefault("trim_upstream", {})[seq_id] = trim_upstream
 
@@ -417,10 +434,11 @@ def predict_borzoi(sequences, request_tasks, matcher_ip=None, matcher_port=None,
     
     Returns:
         tuple: A tuple containing:
-            - task_predictions (dict or str): On success, a dictionary of
-              prediction results. On failure, an error message string.
-            - overall_matcher_version (str): The version of the matcher
-              service used, or "N/A" if it was not called.
+            - task_predictions (dict): A dictionary of prediction results per
+              (request_type, cell_type) task. A task that could not be performed maps to
+              {"error": [{"<error_key>": "<message>"}]} instead of predictions.
+            - overall_matcher_version (str or None): The version of the matcher
+              service used, or None if it was not called.
             
             For optional "all_tracks" tasks, predictions are not averaged over tracks
             and the full prediction matrix is returned (shape [1, num_sliced_bins, 7611 tracks]).
@@ -495,3 +513,253 @@ def predict_borzoi(sequences, request_tasks, matcher_ip=None, matcher_port=None,
         )
         
     return task_predictions, overall_matcher_version
+
+# ============================================================================
+# Test Suite: predict_borzoi math, range slicing, and invariants
+# ============================================================================
+if __name__ == "__main__":
+    """
+    Tests for prediction ranges, trim_upstream math, and sequence tiling.
+    Uses the REAL borzoi_utils functions. No model calls needed.
+
+    Borzoi architecture reference:
+        Input (SEQ_LEN):             524,288 bp
+        Effective input window:      524,288 bp
+        Prediction window:           523,264 bp  (16,352 bins * 32 bp)
+        Buffer per side:             512 bp      (16 bins * 32 bp)
+        BIN_SIZE:                    32 bp
+    """
+    import math
+    import numpy as np
+
+    # -- Constants ----------------------------------------------------------
+    _MIL = SEQ_LEN             # 524,288
+    _PW  = prediction_window   # 523,264
+    _BS  = BIN_SIZE            # 32
+    _SC  = HALF_BUFFER         # 512
+    _BUF = 1024                # 1024 (total buffer)
+    _NBINS = 16352             # 16,352
+
+    # -- Helpers ------------------------------------------------------------
+    def _labeled(n_bins, n_tracks=2):
+        """Mock prediction array where each bin's value = its index."""
+        a = np.zeros((1, n_bins, n_tracks))
+        for i in range(n_bins):
+            a[0, i, :] = i
+        return a
+
+    def _simulate_tail_chunk_math(seq_len):
+        """Simulates the math inside _predict_tail_chunk for long sequences."""
+        seq_chunk_len = seq_len + _SC # Accounts for the prepended upstream buffer
+        downstream_pad = _MIL - seq_chunk_len
+        bases_to_crop = max(0, downstream_pad - _SC)
+        bins_to_crop = bases_to_crop // _BS
+        bins_kept = _NBINS - bins_to_crop
+        return bins_kept
+
+    # -- Test Runner -------------------------------------------------------
+    _p, _f = 0, 0
+    def _ok(cond, name, detail=""):
+        global _p, _f
+        if cond:
+            _p += 1; print(f"  ✓ {name}")
+        else:
+            _f += 1; print(f"  ✗ {name}")
+            if detail: print(f"    {detail}")
+
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("TEST 1: subset_sequence_for_ranges")
+    print("=" * 70)
+
+    # 1a: Standard subset (2M bp sequence, requested [500k, 510k])
+    sub, rs, re = subset_sequence_for_ranges("A"*2_000_000, [500_000, 510_000], _PW, _SC)
+    _ok(len(sub) == _MIL,   f"2M bp → subsetted to exactly {_MIL}", f"Got {len(sub)}")
+    _ok(rs == 257_144,      f"new_range_start = 257,144",     f"Got {rs}")
+    _ok(re == 267_144,      f"new_range_end = 267,144",       f"Got {re}")
+    _ok(re - rs == 10_000,  "Range size preserved (10,000)",  f"Got {re-rs}")
+
+    # 1b: Short sequence — should bypass subsetting math
+    sub2, rs2, re2 = subset_sequence_for_ranges("A"*50_000, [10_000, 30_000], _PW, _SC)
+    _ok(len(sub2) == 50_000,                   "50k: no trimming needed", f"Got {len(sub2)}")
+    _ok(rs2 == 10_000 and re2 == 30_000,       "Range coords perfectly preserved")
+
+    # 1c: Massive range (larger than prediction window)
+    sub3, rs3, _ = subset_sequence_for_ranges("A"*2_000_000, [200_000, 800_000], _PW, _SC)
+    exp3 = (800_000 + _SC) - (200_000 - _SC)
+    _ok(len(sub3) == exp3,  f"Massive range: len = range + 2*context ({exp3})", f"Got {len(sub3)}")
+    _ok(rs3 == _SC,         f"Massive range: new_range_start = {_SC}", f"Got {rs3}")
+
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("TEST 2: slice_prediction_tracks (Short Seq, No Ranges)")
+    print("=" * 70)
+
+    p16352 = _labeled(_NBINS)
+
+    # 2a: 1000 bp
+    sl, tu = slice_prediction_tracks(p16352, 1000, _MIL, _BS, _BUF)
+    _ok(sl.shape[1] == 32,              f"1000 bp → 32 bins", f"Got {sl.shape[1]}")
+    _ok(sl.shape[1]*_BS >= 1000,        f"Covers ≥ 1000 bp ({sl.shape[1]*_BS})")
+    _ok(tu == 12,                       f"trim_upstream = 12", f"Got {tu}")
+    _ok(int(sl[0,0,0]) == 8160,         f"First bin index = 8160", f"Got {int(sl[0,0,0])}")
+
+    # 2b: 200 bp (e.g., MPRA element)
+    sl3, tu3 = slice_prediction_tracks(p16352, 200, _MIL, _BS, _BUF)
+    _ok(sl3.shape[1] == 8,              "200 bp → 8 bins", f"Got {sl3.shape[1]}")
+    _ok(sl3.shape[1]*_BS >= 200,        f"Covers ≥ 200 bp ({sl3.shape[1]*_BS})")
+    _ok(tu3 == 28,                      f"trim_upstream = 28", f"Got {tu3}")
+
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("TEST 3: slice_prediction_tracks_for_range (Short Seq, Ranges)")
+    print("=" * 70)
+
+    # 3a: 50k bp seq, range [10k, 30k]
+    sl_r, tu_r = slice_prediction_tracks_for_range(
+        p16352, 50_000, 10_000, 30_000, _MIL, _BS, _BUF)
+    _ok(sl_r.shape[1] == 626,          f"50k [10k,30k]: 626 bins", f"Got {sl_r.shape[1]}")
+    _ok(sl_r.shape[1]*_BS >= 20_000,   f"Covers ≥ 20,000 bp ({sl_r.shape[1]*_BS})")
+    _ok(tu_r == 8,                     f"trim_upstream = 8", f"Got {tu_r}")
+
+    # 3b: Bin-aligned range (trim should be 0)
+    # 50k seq output offset = 236632. 236632 % 32 = 24. 
+    # Range start of 8 aligns perfectly to a 32bp boundary (24+8=32).
+    sl_a, tu_a = slice_prediction_tracks_for_range(
+        p16352, 50_000, 8, 30_000, _MIL, _BS, _BUF)
+    _ok(tu_a == 0, "Bin-aligned range: trim_upstream = 0", f"Got {tu_a}")
+
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("TEST 4: Odd-Length Sequence Centering Math")
+    print("=" * 70)
+
+    # 4a: 1001 bp (Odd length)
+    sl_odd, tu_odd = slice_prediction_tracks(p16352, 1001, _MIL, _BS, _BUF)
+    _ok(sl_odd.shape[1] == 32,          f"1001 bp → 32 bins", f"Got {sl_odd.shape[1]}")
+    _ok(tu_odd == 11,                   f"Odd trim_upstream = 11", f"Got {tu_odd}")
+    _ok(tu_odd == tu - 1,               "Odd trim = Even trim - 1 (Shifts sequence left 1bp)")
+
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("TEST 5: Long Sequence Tail-Chunk Math Invariant (CASE 2/3)")
+    print("=" * 70)
+    print("Proving that padding downstream 'N's and cropping bins restores the original length (rounded up to whole bins).")
+
+    # 5a: Sequence exactly 100,000 bp long
+    seq_len = 100_000
+    kept_bins = _simulate_tail_chunk_math(seq_len)
+    recovered_bp = kept_bins * _BS
+    _ok(recovered_bp == seq_len, 
+        f"Cropped tail bins recover a sequence length that is a multiple of 32: {kept_bins} bins * 32 = {recovered_bp} bp")
+
+    # 5b: Edge case: Sequence exactly 1 bp long (Extremely short tail)
+    kept_bins_1 = _simulate_tail_chunk_math(1)
+    _ok(kept_bins_1 * _BS == 32, 
+        f"1 bp tail recovers exactly 1 bin (32 bp) to cover the single base.")
+
+    # 5c: General invariant for any tail length: kept bins = ceil(tail_len / bin size)
+    _bad_tails = [t for t in list(range(1, 3000)) + [100_000, 100_001, 100_031, _PW - 1, _PW]
+                  if _simulate_tail_chunk_math(t) != math.ceil(t / _BS)]
+    _ok(not _bad_tails, "Tail bins = ceil(tail_len / 32) for all tested tail lengths",
+        f"Mismatches (first 5): {_bad_tails[:5]}")
+
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("TEST 6: Long Sequence Tiling Range Slicing")
+    print("=" * 70)
+
+    # Mock a concatenated tiled track of 1_000_000 bp (~31250 bins)
+    p_tiled = _labeled(31250)
+
+    # 6a: Range [93304, 103304] 
+    start_bin = math.floor(93304 / _BS)
+    end_bin   = math.ceil(103304 / _BS)
+    sl_tiled  = p_tiled[:, start_bin:end_bin, :]
+    tu_tiled  = 93304 - (start_bin * _BS)
+
+    _ok(sl_tiled.shape[1] == 314,      "314 bins cover 10k bp",   f"Got {sl_tiled.shape[1]}")
+    _ok(int(sl_tiled[0,0,0]) == 2915,  "First bin index = 2915",  f"Got {int(sl_tiled[0,0,0])}")
+    _ok(tu_tiled == 24,                "trim_upstream = 24",      f"Got {tu_tiled}")
+
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("TEST 7: predict_borzoi coordinates end to end (fake model that returns bin coordinates)")
+    print("=" * 70)
+    print("Runs the REAL subsetting, short/long tiling and slicing code. The model is replaced by a stand-in")
+    print("whose value for each bin is the coordinate of that bin's first base in the ORIGINAL sequence.")
+
+    import io, contextlib
+    _rng = np.random.default_rng(0)
+    _POOL = "".join(_rng.choice(list("ACGT"), 2_000_000))
+    _real_encode_predict = _encode_predict_fold_average
+    _orig = ""
+
+    def _coordinate_model(seq_chunk, unique_track_indices):
+        left = (_MIL - len(seq_chunk)) // 2   # dna_1hot centres shorter sequences (floor on the left)
+        lead = len(seq_chunk) - len(seq_chunk.lstrip("N"))
+        real = seq_chunk.strip("N")
+        probe = real[-40:]
+        chunk_start = _orig.find(probe) + len(probe) - len(real) - lead
+        coords = chunk_start - left + _SC + _BS * np.arange(_NBINS)
+        return np.tile(coords[:, None].astype(float), (1, len(unique_track_indices)))
+
+    # (sequence length, prediction range or None). Ranges are half-open [start, end).
+    _cases = [(1, None), (1000, None), (_PW - 1, None), (_PW, None), (_PW + 1, None), (1_200_000, None),
+              (1000, [0, 1]), (1000, [8, 9]), (1000, [999, 1000]), (1000, [0, 1000]),
+              (50_000, [10_000, 30_000]), (_PW + 5000, [_PW + 4990, _PW + 5000]),
+              (2_000_000, [500_000, 510_000]), (2_000_000, [0, 1]), (2_000_000, [1_999_999, 2_000_000]),
+              (2_000_000, [200_000, 200_000 + _PW - 1]), (2_000_000, [200_000, 200_000 + _PW]),
+              (2_000_000, [200_000, 200_000 + _PW + 1]), (2_000_000, [93_304, 103_304])]
+    _key = ("expression", "K562")
+    _encode_predict_fold_average = _coordinate_model
+    for _L, _r in _cases:
+        _orig = _POOL[:_L]
+        _s, _e = (0, _L) if _r is None else (_r[0], _r[1])
+        with contextlib.redirect_stdout(io.StringIO()):
+            _res, _ = predict_borzoi({"seq": _orig}, {_key}, None, None, {"seq": _r} if _r else None, False)
+        _vals = _res[_key]["seq"]
+        _trim = _res[_key]["trim_upstream"]["seq"]
+        _vl = _vals if isinstance(_vals, list) else [_vals]
+        _exp_bins = math.ceil((_trim + _e - _s) / _BS)
+        _good = (isinstance(_vals, list) and 0 <= _trim < _BS and _vl[0] == _s - _trim
+                 and len(_vl) == _exp_bins
+                 and all(b - a == _BS for a, b in zip(_vl, _vl[1:]))
+                 and _vl[0] <= _s < _vl[0] + _BS and _vl[-1] <= _e - 1 < _vl[-1] + _BS)
+        _ok(_good, f"{_L:,} bp, range {_r}: {len(_vl)} bins, trim_upstream {_trim}",
+            f"is list: {isinstance(_vals, list)}; first bin {_vl[0]} (expected {_s - _trim}); "
+            f"{len(_vl)} bins (expected {_exp_bins}); trim {_trim}")
+    _encode_predict_fold_average = _real_encode_predict
+
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print("TEST 8: _assign_predictions_to_tasks (single bin, point readout, failed task)")
+    print("=" * 70)
+
+    _tk, _ek = ("expression", "K562"), ("expression", "unmatched_cell_type")
+    _t2i = {_tk: {"track_indices": [10, 20], "cell_type_actual": "k562", "type_actual": ["RNA"]},
+            _ek: {"error": [{"prediction_request_failed": "No tracks found"}]}}
+
+    # 8a: track readout with a single bin stays a 1-D list, and trim_upstream is stored
+    _tp = copy.deepcopy(_t2i)
+    _assign_predictions_to_tasks(_tp, _t2i, np.array([[[1.0, 3.0]]]), "s", 7, [10, 20], False)
+    _ok(_tp[_tk]["s"] == [2.0],              "Single-bin track readout stays a list: [2.0]", f"Got {_tp[_tk]['s']}")
+    _ok(_tp[_tk]["trim_upstream"]["s"] == 7, "trim_upstream stored for track readout",        f"Got {_tp[_tk].get('trim_upstream')}")
+    _ok(_tp[_ek] == _t2i[_ek],               "Failed task keeps its error object")
+
+    # 8b: point readout averages over tracks, then over bins; no trim_upstream
+    _tp = copy.deepcopy(_t2i)
+    _assign_predictions_to_tasks(_tp, _t2i, np.array([[[1.0, 3.0], [5.0, 7.0]]]), "s", 0, [10, 20], True)
+    _ok(_tp[_tk]["s"] == 4.0,                "Point readout = mean over tracks and bins (4.0)", f"Got {_tp[_tk]['s']}")
+    _ok("trim_upstream" not in _tp[_tk],     "Point readout stores no trim_upstream")
+
+    # ======================================================================
+    # Summary
+    # ======================================================================
+    print("\n" + "=" * 70)
+    print(f"RESULTS: {_p} passed, {_f} failed out of {_p + _f}")
+    print("=" * 70)
+    if _f:
+        print("\n❌  FAILURES — review output above.")
+    else:
+        print("\n✅ All Borzoi math invariants successfully verified!")
