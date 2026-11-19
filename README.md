@@ -69,7 +69,7 @@ This container for Predictor includes:
 
 4. **Request Validation**:
     - Validates mandatory top-level keys (`readout`, `prediction_tasks`, `sequences`) and per-task keys (`name`, `type`, `cell_type`, `species`).
-    - Rejects unsupported request features at the API edge (see [Section 2.3](#23-supported-request-features)).
+    - Rejects invalid requests at the API edge; tasks Borzoi cannot perform are returned as failed tasks (see [Section 2.3](#23-supported-request-features)).
     - Returns standardized error responses (400, 422, 500) keyed by violation category.
 
 5. **Predict-Once-Filter-Many**:
@@ -77,7 +77,7 @@ This container for Predictor includes:
     - For a request with multiple tasks (e.g. `(expression, K562)` and `(accessibility, K562)`), tracks are deduplicated before extraction so that the same track is never selected twice. Per-task averaging happens on the already-filtered prediction array.
 
 6. **Multi-Task Tolerance**:
-    - Per-task failures (unmatched cell types, missing tracks, Matcher errors) are recorded inline as `{"error": ...}` entries in `task_predictions`. Other tasks in the same request are still processed and returned.
+    - Per-task failures (unmatched cell types, missing tracks, unsupported `species` or `type`, or a Matcher that failed or was unreachable, which uses the distinct key `upstream_dependency_failed`) are returned as that task's `predictions`, in the form `{"error": [{"prediction_request_failed": "<message>"}]}`, with all `*_actual` keys set to `null` (see [Section 4.3](#43-tasks-that-cannot-be-performed)). Other tasks in the same request are still processed and returned, and the HTTP status stays 200.
     - This differs from DREAM-RNN (due to Borzoi's multi-task training), which rejects the entire request if any task has an unsupported feature.
 
 7. **Help Endpoint**:
@@ -108,8 +108,10 @@ For each (request_type, cell_type) in request_tasks:
             (or binding molecule, for binding_* requests)
        3.2. Re-lookup indices using the matched value
        3.3. cell_type_actual = matched_cell_type
+       3.4. If the Matcher finds no match: record {"error": [{"prediction_request_failed": ...}]} for this task; continue with other tasks
+       3.5. If the Matcher is unreachable: record {"error": [{"upstream_dependency_failed": ...}]} for this task; continue with other tasks
   4. If no exact match AND Matcher not configured:
-       Record {"error": ...} for this task; continue with other tasks
+       Record {"error": [{"prediction_request_failed": ...}]} for this task; continue with other tasks
   5. Add this task's indices to unique_track_indices (a set)
 
 Final unique_track_indices is the union of all tracks needed across all tasks
@@ -192,25 +194,25 @@ The response includes explicit `aggregation` metadata indicating which axes were
 | `type = expression_pol2` | ✅ | CAGE tracks (falls back to RNA if no CAGE match) |
 | `type = accessibility` | ✅ | Concatenates ATAC + DNASE tracks |
 | `type = binding_[molecule]` | ✅ | ChIP-seq tracks for the specified molecule |
-| `type = conformation_*` | ❌ | Not supported |
-| `species = homo_sapiens` | ✅ | |
-| Other species | ❌ | Rejected with `prediction_request_failed` (422) |
+| `type = conformation_*` | ❌ | Not supported: that task fails with `prediction_request_failed` (other tasks are still returned) |
+| `species = homo_sapiens` | ✅ | `species` is the species of the cells in which the experiment was performed. `species_actual` is `homo_sapiens`, the species Borzoi predicts for |
+| Other species | ❌ | That task fails with `prediction_request_failed` and `species_actual: null` (other tasks are still returned) |
 | `scale = linear` (default) | ✅ | Native model output |
 | `scale = log` | ✅ | Output is `log2(x + 1)` |
 | `cell_type` | ✅ | Exact match preferred; Matcher used as fallback |
 | `prediction_ranges` | ✅ | Predicts with full context, slices to range |
 | `upstream_seq` / `downstream_seq` | ✅ | Prepended/appended before prediction |
 
-**Multi-task request behaviour**: Borzoi processes each task independently. A failure in one task (no matching tracks, Matcher unavailable, etc.) is reported inline and does not block others in the same request.
+**Multi-task request behaviour**: Borzoi processes each task independently. A failure in one task (no matching tracks, unsupported species or type) is reported inline and does not block others in the same request. If the Matcher is needed but fails or is unreachable, only the tasks that needed it fail, with the distinct error key `upstream_dependency_failed` (a real "no match" uses `prediction_request_failed`); the other tasks are still returned (see [Section 2.4](#24-error-handling)).
 
 ### 2.4 Error Handling
 
 | Status | Error key | Triggers |
 |---|---|---|
-| 400 | `bad_prediction_request` | Malformed JSON/msgpack, missing mandatory keys, invalid `prediction_ranges` format, unsupported readout |
-| 422 | `prediction_request_failed` | Sequence has invalid characters, empty sequence, unsupported species/type/scale, `prediction_ranges` out of bounds |
+| 400 | `bad_prediction_request` | Malformed JSON/msgpack, missing mandatory keys, invalid `readout`, `type` or `scale` value (not part of the GAME schema), invalid `prediction_ranges` (format, `start >= end`, or out of bounds: `start` must be < sequence length and `end` must be <= sequence length) |
+| 422 | `prediction_request_failed` | Valid request that Borzoi cannot handle: unsupported readout (`interaction_matrix`), sequence has invalid characters, empty sequence |
 | 500 | `server_error` | Model load failure, unexpected internal error |
-| 502 | `upstream_dependency_failed` | Fatal network failure of a required external service (e.g. Matcher unreachable). Distinct from per-task `prediction_request_failed` because the entire request cannot be served, not just one task |
+| 200 (per task, inside `predictions`) | `prediction_request_failed`, `upstream_dependency_failed` | A task that could not be performed: no matching tracks or unsupported species/type (`prediction_request_failed`), or the Matcher was needed but failed or was unreachable (`upstream_dependency_failed`). The other tasks in the request are still returned |
 
 ---
 
@@ -261,7 +263,7 @@ apptainer run --nv --containall borzoi_human_predictor.sif HOST PORT [MATCHER_IP
 - `--nv`: enables NVIDIA GPU support (required).
 - `--containall`: full runtime isolation (blocks host directory mounts, scrubs environment variables).
 - Replace `HOST` with the server IP (e.g. from `hostname -I`) and `PORT` with an open port number above 1024.
-- `MATCHER_IP` and `MATCHER_PORT` are optional. Without them, the predictor runs in "exact-match-only" mode and reports `matcher_version: "N/A"` in responses.
+- `MATCHER_IP` and `MATCHER_PORT` are optional. Without them, the predictor runs in "exact-match-only" mode and omits `matcher_version` from responses. `matcher_version` is only returned when the Matcher was used (and is `null` if the Matcher did not return a version).
 
 #### Example
 
@@ -308,7 +310,6 @@ Matcher service is NOT configured. Running in 'exact-match-only' mode.
 ```json
 {
     "predictor_name": "Borzoi_Human_20251128-180629_PST",
-    "matcher_version": "N/A",
     "bin_size": 32,
     "prediction_tasks": [
         {
@@ -335,6 +336,29 @@ The `predictor_name` matches the container build timestamp, allowing evaluation 
 
 Note: For track requests, once the Evaluator expands Borzoi predictions using `bin_size`, they should be cropped using `trim_upstream` upstream and the remaining downstream excess should be cropped to achieve a 1-1 mapping of sequence to predictions. 
 
+`matcher_version` is not shown above because the Matcher was not used (an exact cell-type match was found). When the Matcher is used, the `matcher_version` it returned is included at the top level of the response (`null` if the Matcher was used but did not return a version). If the Matcher is needed but fails or is unreachable and no version could be obtained from any task, `matcher_version` is `null`.
+
+### 4.3 Tasks that cannot be performed
+
+If a request has several `prediction_tasks`, Borzoi predicts every task it can and still returns the ones it cannot (for example, no tracks match the requested cell type, or the requested `species` is not `homo_sapiens`). The HTTP status stays 200. A task that could not be performed has `name` and all `*_requested` keys as normal, every `*_actual` key set to `null`, an error object as `predictions`, and no `aggregation` or `trim_upstream`:
+
+```json
+{
+    "name": "unmatched_cell_type",
+    "type_requested": "expression",
+    "type_actual": null,
+    "cell_type_requested": "made_up_cell_type_xyz",
+    "cell_type_actual": null,
+    "species_requested": "homo_sapiens",
+    "species_actual": null,
+    "scale_prediction_requested": "linear",
+    "scale_prediction_actual": null,
+    "predictions": {
+        "error": [{"prediction_request_failed": "No tracks found for expression in cell type 'made_up_cell_type_xyz'"}]
+    }
+}
+```
+
 ---
 
 ## 5. Additional Notes about the `%environment` Block in the Definition File
@@ -351,6 +375,9 @@ Note: For track requests, once the Evaluator expands Borzoi predictions using `b
     export CUDA_HOME="/opt/conda/envs/borzoi-gpu"
     # Configure TensorFlow to use the newer cuDNN frontend API, rather than the legacy API
     export TF_CUDNN_USE_FRONTEND=1
+    # TensorFlow 2.15 has no prebuilt kernels for newer GPUs (e.g. H100, compute capability 9.0) and JIT-compiles
+    # them with the ptxas/libdevice bundled in the environment; point XLA at that directory
+    export XLA_FLAGS="--xla_gpu_cuda_data_dir=/opt/conda/envs/borzoi-gpu/lib/python3.9/site-packages/nvidia/cuda_nvcc${XLA_FLAGS:+ $XLA_FLAGS}"
 ```
 
 - `export APPTAINER_NO_MOUNT="home,tmp,proc,sys,dev"`:
