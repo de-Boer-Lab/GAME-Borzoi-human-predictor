@@ -16,7 +16,7 @@ if BORZOI_DIR not in sys.path:
     sys.path.insert(0, BORZOI_DIR)
 
 from borzoi_predict_codebase import predict_borzoi
-from model_validation import model_specific_payload_validation, apply_scaling
+from model_validation import model_specific_payload_validation, apply_scaling, unsupported_task_reason, MODEL_SPECIES
 
 # --- Have arguments be defined globally ---
 parser = argparse.ArgumentParser(description=f'{PREDICTOR_NAME} Predictor API')
@@ -182,6 +182,8 @@ def predict():
         request_tasks = set()  # Store unique (request_type, cell_type) pairs
         
         for prediction_task in evaluator_request['prediction_tasks']:
+            if unsupported_task_reason(prediction_task):
+                continue  # Not sent to the model; returned as a failed task below
             request_type = prediction_task['type']
             cell_type = prediction_task['cell_type']
             request_tasks.add((request_type, cell_type))
@@ -207,21 +209,22 @@ def predict():
         #     # Wrap the error string into error payload 
         #     raise PredictionFailedError(task_predictions)
         
-        # Pre-check: If the Matcher service suffered a fatal network failure, 
-        # fail the entire request immediately before formatting the JSON.
-        for task_data in task_predictions.values():
-            if "error" in task_data and "dependent Matcher service" in task_data["error"]:
-                from error_checking_functions import UpstreamDependencyError
-                raise UpstreamDependencyError(task_data["error"])
-        
+        # If the Matcher failed or was unreachable for a task, that task comes back as an error object
+        # ({"upstream_dependency_failed": ...}) and is returned like any other failed task below.
+        # Tasks that did not need the Matcher, or that it matched, are still returned.
+
         # Now format predictions to API JSON structure
         # Create JSON to return
         json_return = {
-            'matcher_version': matcher_version,
             'bin_size': 32,
             # Prediction task is an array of objects for all requested tasks
             'prediction_tasks': []
         }
+        # matcher_version is only returned if a Matcher was used. If the Matcher was used but
+        # did not return a version ("UnknownMatcher" placeholder in borzoi_utils.py), it is null.
+        if matcher_version is not None:
+            json_return = {'matcher_version': None if matcher_version == "UnknownMatcher" else matcher_version,
+                           **json_return}
         
         # Loop through all the prediction tasks
         for prediction_task in evaluator_request['prediction_tasks']:
@@ -235,8 +238,13 @@ def predict():
 
             # Retrieve the predictions for this task
             task_key = (request_type, cell_type)
-            # Get raw result first
-            task_result = task_predictions[task_key]
+            # Get raw result first. Tasks Borzoi cannot perform (unsupported species/type)
+            # were not predicted, so they get an error object instead.
+            unsupported_reason = unsupported_task_reason(prediction_task)
+            if unsupported_reason:
+                task_result = {"error": [{"prediction_request_failed": unsupported_reason}]}
+            else:
+                task_result = task_predictions[task_key]
             
             # Build the base dictionary with all common keys
             predictions = {
@@ -250,13 +258,13 @@ def predict():
                 current_prediction_task = {
                     'name': task_name,
                     'type_requested': request_type,
-                    'type_actual': "N/A",
+                    'type_actual': None,
                     'cell_type_requested': cell_type,
-                    'cell_type_actual': "N/A",
+                    'cell_type_actual': None,
                     'species_requested': prediction_task['species'],
-                    'species_actual': prediction_task['species'],
+                    'species_actual': None,
                     'scale_prediction_requested': prediction_task.get('scale', None),
-                    'scale_prediction_actual': "N/A",
+                    'scale_prediction_actual': None,
                     'predictions': predictions  
                 }
             else:
@@ -290,7 +298,7 @@ def predict():
                     'cell_type_requested': prediction_task['cell_type'],
                     'cell_type_actual': task_result['cell_type_actual'],
                     'species_requested': prediction_task['species'],
-                    'species_actual': prediction_task['species'],
+                    'species_actual': MODEL_SPECIES,
                     'scale_prediction_requested': requested_scale,
                     'scale_prediction_actual': effective_scale,
                     'predictions': predictions_scaled
