@@ -81,6 +81,13 @@ def _sanitize_for_json(obj):
     else:
         return obj
 
+def _has_non_finite(obj):
+    if isinstance(obj, dict):
+        return any(_has_non_finite(v) for v in obj.values())
+    elif isinstance(obj, list):
+        return any(_has_non_finite(v) for v in obj)
+    return isinstance(obj, float) and not math.isfinite(obj)
+
 # -------- Flask App and Central Error Handler --------
 app = Flask(__name__)
 app.json.sort_keys = False
@@ -253,6 +260,11 @@ def predict():
                 if seq_id not in ['track_indices', 'cell_type_actual', 'type_actual', 'trim_upstream']
             }
             
+            # A non-finite prediction means the model failed for this task: return a failed task
+            # instead of clamping the value to a large finite number
+            if "error" not in predictions and _has_non_finite(predictions):
+                predictions = {"error": [{"prediction_request_failed": "The model returned non-finite values (inf or NaN) for this task."}]}
+
             if "error" in predictions:
                 # Create structured response for the evaluator
                 current_prediction_task = {

@@ -200,7 +200,7 @@ def _encode_predict_fold_average(seq_chunk, unique_track_indices):
     raw_pred = predict_tracks(models, encoded_seq)[:, :, :, unique_track_indices]
     
     # Average across model folds to reduce (1, n_folds, 16352, num_tracks) -> (1, 16352, num_tracks)
-    fold_averaged_predictions = np.mean(raw_pred, axis=1).squeeze(0) # Shape (16352, num_tracks)
+    fold_averaged_predictions = np.mean(raw_pred, axis=1, dtype=np.float32).squeeze(0) # Shape (16352, num_tracks)
     
     return fold_averaged_predictions
 
